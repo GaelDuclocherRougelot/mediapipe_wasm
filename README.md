@@ -103,7 +103,7 @@ Côté JS : `new Module.GpuVideoDemo()` → `.initialize()` → `.processFrame(.
 5. `graph_.StartRun({})` — démarre le graphe, qui reste actif indéfiniment.
 
 **`ProcessFrame(rgba, width, height)`** (`gpu_video_demo_wasm.cc:83-108`), appelée à chaque frame :
-1. `emscripten::vecFromJSArray<uint8_t>(rgba)` — copie le `Uint8Array` JS (RGBA brut) dans un `std::vector` C++.
+1. Copie le buffer JS (RGBA brut) dans `input_pixels_`, un `std::vector<uint8_t>` membre persistant, via un `TypedArray.set()` natif (voir 3.7 — remplace l'ancien `emscripten::vecFromJSArray`, ~31x plus lent).
 2. Construit un `ImageFrame` CPU à partir de ces pixels.
 3. `gpu_helper_.RunInGlContext([...])` — bascule sur le contexte GL dédié pour : uploader l'`ImageFrame` en texture GPU (`CreateSourceTexture`), récupérer un `GpuBuffer` qui la référence, et pousser ce buffer comme paquet d'entrée du graphe.
 4. `graph_.WaitUntilIdle()` — fait tourner le graphe pour cette frame : le shader du `SquareOverlayCalculator` s'exécute sur GPU, le résultat sort sur `"output_video"`, ce qui invoque **synchroniquement** le callback `ReadBackFrame` (étape 5 ci-dessous), avant que `WaitUntilIdle()` ne retourne.
@@ -175,9 +175,32 @@ Les artefacts (`gpu_video_demo.js`, `gpu_video_demo.wasm`) sont générés en le
 python3 -m http.server 8080 --directory /chemin/vers/le/dossier
 ```
 
-### État connu, non résolu
+### 3.7 Optimisation résolue : le vrai goulot n'était pas le GPU
 
-À 720p, le pipeline tourne à ~6 FPS. Le goulot d'étranglement suspecté est `glReadPixels` (étape 3.3.5) — un stall synchrone qui force le GPU à finir tout son travail en attente avant de rendre la main au CPU. Une tentative de rendu direct-à-l'écran (via `mediapipe::QuadRenderer`, en éliminant le readback CPU) a cassé l'affichage et a été annulée sans diagnostic root-cause — à reprendre avec instrumentation avant de retenter.
+À 720p, le pipeline tournait initialement à ~6 FPS (`processFrame` ~266ms). L'hypothèse naturelle — `glReadPixels` (étape 3.3.5), un stall synchrone qui force le GPU à finir tout son travail avant de rendre la main au CPU — s'est révélée **fausse**. Une première tentative de correction basée sur cette hypothèse (rendu direct-à-l'écran via `mediapipe::QuadRenderer`, éliminant le readback CPU) a cassé l'affichage sans qu'on ait mesuré quoi que ce soit au préalable, et a dû être annulée.
+
+**Méthode qui a fonctionné : instrumenter avant de corriger.** Un chronométrage (`performance.now()` côté JS dans `worker.js`, `std::chrono` côté C++ dans `ProcessFrame`) a permis de bisecter précisément où passait le temps :
+
+| Étape | Avant | Après |
+|---|---|---|
+| `vecFromJSArray<uint8_t>` (copie JS→`std::vector`) | **~275ms** | ~0.25ms |
+| `ImageFrame` (ctor + copie) | ~0.3ms | ~0.25ms |
+| Upload texture GPU | ~1-2ms | ~1.75ms |
+| Shader + readback (dont `glReadPixels`) | ~5ms (dont ~2-4ms) | inchangé |
+
+Le vrai goulot : `emscripten::vecFromJSArray<uint8_t>` marshale le buffer **élément par élément** à travers la machinerie générique `emscripten::val` — un aller-retour JS↔C++ par octet. Pour ~3,6M octets (1280×720×4) à 720p, ça donne exactement les ~275ms observés. Le GPU, le shader et `glReadPixels` n'étaient responsables que de quelques millisecondes — un faux coupable.
+
+**Correction** (`gpu_video_demo_wasm.cc`, méthode `ProcessFrame`) : remplacer la copie élément-par-élément par un seul appel natif `TypedArray.set()`. On expose un buffer wasm persistant (`input_pixels_`, un `std::vector<uint8_t>` membre, redimensionné seulement si la résolution change) comme vue typée via `emscripten::typed_memory_view`, puis on laisse le moteur JS faire la copie en une fois :
+
+```cpp
+emscripten::val heap_view(
+    emscripten::typed_memory_view(input_pixels_.size(), input_pixels_.data()));
+heap_view.call<void>("set", rgba);  // memcpy natif, une seule frontière JS↔C++ franchie
+```
+
+Résultat : `processFrame` est passé de ~266ms à ~8.5ms (gain ~31x), largement sous les 33ms nécessaires pour du 30 FPS fluide — confirmé visuellement.
+
+**Leçon générale** : `emscripten::vecFromJSArray` est adapté à de petits tableaux, mais catastrophique pour du binaire volumineux (frames vidéo, buffers audio, etc.). Pour tout transfert de données brutes JS→wasm de taille significative, préférer un buffer wasm persistant + `TypedArray.set()` côté JS plutôt que les helpers de conversion génériques d'Embind.
 
 ---
 
@@ -192,3 +215,4 @@ python3 -m http.server 8080 --directory /chemin/vers/le/dossier
 | `-sENVIRONMENT=web,worker` | Stage 2 | Nécessaire pour charger le glue JS via `importScripts()` dans un Worker |
 | Un seul Worker suffit, pas besoin de `-pthread` | Stage 2 | Le graphe MediaPipe est déjà mono-thread sous Emscripten de toute façon |
 | Nom du `cc_binary` = nom des `outputs` du `wasm_cc_binary` | Stage 1 + 2 | Le glue JS référence en dur le nom du fichier `.wasm` d'origine |
+| `TypedArray.set()` plutôt que `vecFromJSArray` pour du binaire volumineux | Stage 2 | `vecFromJSArray` marshale élément par élément — ~31x plus lent qu'un memcpy natif sur une frame vidéo |

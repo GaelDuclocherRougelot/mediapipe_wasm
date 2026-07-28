@@ -11,11 +11,6 @@ let demo = null;
 let scratchCanvas = null;
 let scratchCtx = null;
 
-// Timing instrumentation to find the real bottleneck before attempting any
-// further optimization (root-caused, not guessed).
-let timings = { draw: 0, getImageData: 0, processFrame: 0, postMessage: 0 };
-let timingFrames = 0;
-
 self.onmessage = async (e) => {
   const msg = e.data;
 
@@ -39,39 +34,16 @@ self.onmessage = async (e) => {
       scratchCtx = scratchCanvas.getContext("2d", { willReadFrequently: true });
     }
 
-    let t0 = performance.now();
     scratchCtx.drawImage(bitmap, 0, 0);
     bitmap.close();
-    let t1 = performance.now();
     const { data } = scratchCtx.getImageData(0, 0, width, height);
-    let t2 = performance.now();
 
     const result = demo.processFrame(data, width, height);
-    let t3 = performance.now();
-
     // `result` is a view into the wasm module's own heap memory (invalidated
     // by the next allocation). Copy it into a fresh ArrayBuffer we own
     // before transferring it back to the main thread -- transferring wasm's
     // own memory would detach it from the module.
     const outBuffer = new Uint8Array(result).buffer;
     self.postMessage({ type: "result", buffer: outBuffer, width, height }, [outBuffer]);
-    let t4 = performance.now();
-
-    timings.draw += t1 - t0;
-    timings.getImageData += t2 - t1;
-    timings.processFrame += t3 - t2;
-    timings.postMessage += t4 - t3;
-    timingFrames++;
-    if (timingFrames >= 30) {
-      console.log(
-        `[worker] avg ms/frame over ${timingFrames} frames -- ` +
-        `draw: ${(timings.draw / timingFrames).toFixed(2)}, ` +
-        `getImageData: ${(timings.getImageData / timingFrames).toFixed(2)}, ` +
-        `processFrame: ${(timings.processFrame / timingFrames).toFixed(2)}, ` +
-        `postMessage: ${(timings.postMessage / timingFrames).toFixed(2)}`
-      );
-      timings = { draw: 0, getImageData: 0, processFrame: 0, postMessage: 0 };
-      timingFrames = 0;
-    }
   }
 };

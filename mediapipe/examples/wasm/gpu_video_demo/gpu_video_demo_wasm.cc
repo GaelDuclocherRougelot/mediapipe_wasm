@@ -82,12 +82,24 @@ class GpuVideoDemo {
   // allocation).
   emscripten::val ProcessFrame(emscripten::val rgba, int width, int height) {
     ABSL_CHECK(initialized_);
-    std::vector<uint8_t> pixels = emscripten::vecFromJSArray<uint8_t>(rgba);
-    ABSL_CHECK_EQ(pixels.size(), static_cast<size_t>(width) * height * 4);
+
+    // vecFromJSArray<uint8_t> marshals element-by-element through the
+    // generic emscripten::val machinery -- catastrophically slow for a
+    // multi-megabyte frame (measured ~275ms at 720p, ~31x slower than the
+    // approach below). Instead, expose a persistent wasm-heap buffer as a
+    // typed array view and let the JS engine do a single native
+    // TypedArray.set() bulk copy into it.
+    size_t expected_size = static_cast<size_t>(width) * height * 4;
+    if (input_pixels_.size() != expected_size) {
+      input_pixels_.resize(expected_size);
+    }
+    emscripten::val heap_view(
+        emscripten::typed_memory_view(input_pixels_.size(), input_pixels_.data()));
+    heap_view.call<void>("set", rgba);
 
     auto input_frame = std::make_unique<ImageFrame>(
         ImageFormat::SRGBA, width, height, ImageFrame::kGlDefaultAlignmentBoundary);
-    input_frame->CopyPixelData(ImageFormat::SRGBA, width, height, pixels.data(),
+    input_frame->CopyPixelData(ImageFormat::SRGBA, width, height, input_pixels_.data(),
                                ImageFrame::kGlDefaultAlignmentBoundary);
 
     size_t timestamp_us = frame_count_++;
@@ -127,6 +139,7 @@ class GpuVideoDemo {
   GlCalculatorHelper gpu_helper_;
   bool initialized_ = false;
   size_t frame_count_ = 0;
+  std::vector<uint8_t> input_pixels_;
   std::vector<uint8_t> output_buffer_;
 };
 
