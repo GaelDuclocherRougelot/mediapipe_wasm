@@ -53,6 +53,13 @@ http_archive(
     name = "com_github_glog_glog",
     sha256 = "8a83bf982f37bb70825df71a9709fa90ea9f4447fb3c099e1d720a439d88bad6",
     strip_prefix = "glog-0.6.0",
+    patch_args = [
+        "-p1",
+    ],
+    patches = [
+        "@//third_party:com_github_glog_glog_emscripten.diff",
+        "@//third_party:com_github_glog_glog_emscripten_gettid.diff",
+    ],
     urls = [
         "https://github.com/google/glog/archive/v0.6.0.tar.gz",
     ],
@@ -492,10 +499,7 @@ new_local_repository(
 new_local_repository(
     name = "macos_opencv",
     build_file = "@//third_party:opencv_macos.BUILD",
-    # For local MacOS builds, the path should point to an opencv@3 installation.
-    # If you edit the path here, you will also need to update the corresponding
-    # prefix in "opencv_macos.BUILD".
-    path = "/usr/local",  # e.g. /usr/local/Cellar for HomeBrew
+    path = "/opt/homebrew",
 )
 
 new_local_repository(

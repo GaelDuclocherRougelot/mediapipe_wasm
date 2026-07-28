@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Quantiq GPU Video Demo (WebGL, off main thread)</title>
+  </head>
+  <body>
+    <p id="status">Starting worker...</p>
+    <p id="fps"></p>
+    <div>
+      <p>Source (webcam):</p>
+      <canvas id="source-canvas" width="320" height="240"></canvas>
+    </div>
+    <div>
+      <p>Output (red square overlay, produced by SquareOverlayCalculator on GPU, running in a Worker):</p>
+      <canvas id="output-canvas" width="320" height="240"></canvas>
+    </div>
+    <!-- The actual <video> element receiving the camera stream. Hidden:
+         frames are drawn into source-canvas every rAF tick instead. -->
+    <video id="webcam-video" autoplay playsinline muted style="display: none"></video>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const fpsEl = document.getElementById("fps");
+      const video = document.getElementById("webcam-video");
+      const sourceCanvas = document.getElementById("source-canvas");
+      const outputCanvas = document.getElementById("output-canvas");
+      const sourceCtx = sourceCanvas.getContext("2d", { willReadFrequently: true });
+      const outputCtx = outputCanvas.getContext("2d");
+
+      let width = 0;
+      let height = 0;
+      let frameCount = 0;
+      let lastFpsUpdate = performance.now();
+      let frameInFlight = false;
+
+      const worker = new Worker("worker.js");
+
+      worker.onmessage = (e) => {
+        const msg = e.data;
+        if (msg.type === "ready") {
+          statusEl.textContent =
+            "Worker ready (GPU graph initialized off the main thread). Requesting webcam...";
+          startWebcam();
+        } else if (msg.type === "result") {
+          const outImageData = new ImageData(
+            new Uint8ClampedArray(msg.buffer),
+            msg.width,
+            msg.height
+          );
+          outputCtx.putImageData(outImageData, 0, 0);
+          frameInFlight = false;
+
+          frameCount++;
+          const now = performance.now();
+          if (now - lastFpsUpdate >= 1000) {
+            fpsEl.textContent = "FPS: " + frameCount;
+            frameCount = 0;
+            lastFpsUpdate = now;
+          }
+        } else if (msg.type === "error") {
+          statusEl.textContent = "Worker error: " + msg.message;
+          console.error(msg.message);
+        }
+      };
+
+      // Kick off GL context / graph init inside the worker, handing it a
+      // standalone OffscreenCanvas -- this canvas backs the WebGL context
+      // gl_context_webgl.cc creates (hardcoded "#canvas" target -> Module.canvas)
+      // but its own size is irrelevant to per-frame processing, since
+      // MediaPipe renders into its own framebuffers/textures sized per call.
+      const glCanvas = new OffscreenCanvas(320, 240);
+      worker.postMessage({ type: "init", canvas: glCanvas }, [glCanvas]);
+
+      async function startWebcam() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 320 }, height: { ideal: 240 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+        if (!video.videoWidth) {
+          await new Promise((resolve) =>
+            video.addEventListener("loadedmetadata", resolve, { once: true })
+          );
+        }
+        width = video.videoWidth;
+        height = video.videoHeight;
+        sourceCanvas.width = width;
+        sourceCanvas.height = height;
+        outputCanvas.width = width;
+        outputCanvas.height = height;
+        statusEl.textContent =
+          "Running (" + width + "x" + height + ") -- wasm running in a Worker";
+        requestAnimationFrame(tick);
+      }
+
+      async function tick() {
+        sourceCtx.drawImage(video, 0, 0, width, height);
+
+        // Simple backpressure: only have one frame in flight to the worker
+        // at a time, so a slow processFrame() doesn't queue up a growing
+        // backlog of postMessage calls. The visible source preview above
+        // still refreshes every rAF regardless.
+        if (!frameInFlight) {
+          frameInFlight = true;
+          const bitmap = await createImageBitmap(sourceCanvas);
+          worker.postMessage({ type: "frame", bitmap, width, height }, [bitmap]);
+        }
+
+        requestAnimationFrame(tick);
+      }
+    </script>
+  </body>
+</html>

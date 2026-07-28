@@ -40,11 +40,11 @@ if [ -z "$1" ]
     echo "Installing OpenCV from source"
     if [[ -x "$(command -v apt)" ]]; then
       sudo apt update && sudo apt install build-essential git
-      sudo apt install cmake ffmpeg libavformat-dev libdc1394-22-dev libgtk2.0-dev \
+      sudo apt install cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ffmpeg libavformat-dev libdc1394-22-dev libgtk2.0-dev \
                        libjpeg-dev libpng-dev libswscale-dev libtbb2 libtbb-dev \
                        libtiff-dev
     elif [[ -x "$(command -v dnf)" ]]; then
-      sudo dnf update && sudo dnf install cmake gcc gcc-c git
+      sudo dnf update && sudo dnf install cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 gcc gcc-c git
       sudo dnf install ffmpeg-devel libdc1394-devel gtk2-devel \
                        libjpeg-turbo-devel libpng-devel tbb-devel \
                        libtiff-devel
@@ -60,7 +60,7 @@ if [ -z "$1" ]
     cd ../opencv
     git checkout 3.4
     cd release
-    cmake .. -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_INSTALL_PREFIX=/usr/local \
+    cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. -DCMAKE_BUILD_TYPE=RELEASE -DCMAKE_INSTALL_PREFIX=/usr/local \
           -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_opencv_ts=OFF \
           -DOPENCV_EXTRA_MODULES_PATH=/tmp/build_opencv/opencv_contrib/modules \
           -DBUILD_opencv_aruco=OFF -DBUILD_opencv_bgsegm=OFF -DBUILD_opencv_bioinspired=OFF \

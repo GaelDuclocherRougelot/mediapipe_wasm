@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Quantiq WASM Demo</title>
+  </head>
+  <body>
+    <pre id="output">Loading wasm module...</pre>
+    <script src="quantiq_demo.js"></script>
+    <script>
+      QuantiqModule()
+        .then((Module) => {
+          const result = Module.processString("Hello Quantiq");
+          document.getElementById("output").textContent = result;
+          console.log("processString result:", result);
+        })
+        .catch((err) => {
+          document.getElementById("output").textContent = "ERROR: " + err;
+          console.error(err);
+        });
+    </script>
+  </body>
+</html>

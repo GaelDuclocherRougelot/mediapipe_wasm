@@ -1,0 +1,11 @@
+--- a/src/utilities.cc
++++ b/src/utilities.cc
+@@ -258,7 +258,7 @@
+
+ pid_t GetTID() {
+   // On Linux and MacOSX, we try to use gettid().
+-#if defined GLOG_OS_LINUX || defined GLOG_OS_MACOSX
++#if (defined GLOG_OS_LINUX || defined GLOG_OS_MACOSX) && !defined(__EMSCRIPTEN__)
+ #ifndef __NR_gettid
+ #ifdef GLOG_OS_MACOSX
+ #define __NR_gettid SYS_gettid
