@@ -1,175 +1,194 @@
+# MediaPipe custom calculators dans le navigateur (WASM) — comment ça marche
+
+Ce document explique l'architecture des deux démos WASM du repo :
+
+- `mediapipe/examples/wasm/quantiq_demo/` — **Stage 1** : CPU only, preuve de concept minimale.
+- `mediapipe/examples/wasm/gpu_video_demo/` — **Stage 2** : GPU (WebGL), flux vidéo webcam, calculateur custom avec shader, exécution dans un Web Worker.
+
+Les deux réutilisent le même principe de base : compiler des calculateurs MediaPipe C++ en WebAssembly avec Emscripten, et exposer un pont JS↔C++ via **Embind**.
+
 ---
-layout: forward
-target: https://developers.google.com/mediapipe
-title: Home
-nav_order: 1
+
+## 1. Vue d'ensemble : pourquoi ce n'est pas juste "compiler avec Emscripten"
+
+MediaPipe fournit officiellement des binaires WASM précompilés (`graph_runner.ts` et consorts) pour du JS haut-niveau clé-en-main. Mais ces bindings référencent des dizaines de symboles natifs qui n'existent **dans aucun fichier source de ce dépôt** — seuls les binaires propriétaires de Google les implémentent. Impossible de les réutiliser tels quels pour un calculateur custom.
+
+La solution retenue ici : écrire notre **propre petit pont Embind**, minimal, qui expose exactement ce dont on a besoin (une fonction ou une classe C++), et laisser Emscripten gérer la compilation du graphe MediaPipe complet (framework + calculateurs) en `.wasm`.
+
 ---
 
-----
+## 2. Stage 1 — CPU only (`quantiq_demo/`)
 
-**Attention:** *We have moved to
-[https://developers.google.com/mediapipe](https://developers.google.com/mediapipe)
-as the primary developer documentation site for MediaPipe as of April 3, 2023.*
+### Fichiers
 
-![MediaPipe](https://developers.google.com/static/mediapipe/images/home/hero_01_1920.png)
+- `mediapipe/calculators/quantiq_demo/exclaim_calculator.cc` — calculateur custom simple (ajoute des `!` à une string).
+- `mediapipe/examples/wasm/quantiq_demo/quantiq_demo_wasm.cc` — le pont Embind.
+- `mediapipe/examples/wasm/quantiq_demo/BUILD` — règles de build.
+- `mediapipe/examples/wasm/quantiq_demo/index.html` — page de test.
 
-**Attention**: MediaPipe Solutions Preview is an early release. [Learn
-more](https://developers.google.com/mediapipe/solutions/about#notice).
+### Le graphe
 
-**On-device machine learning for everyone**
+```
+"in" -> PassThroughCalculator -> "out1" -> ExclaimCalculator -> "out"
+```
 
-Delight your customers with innovative machine learning features. MediaPipe
-contains everything that you need to customize and deploy to mobile (Android,
-iOS), web, desktop, edge devices, and IoT, effortlessly.
+Construit et exécuté en entier à chaque appel (`ProcessString`), de façon synchrone, bloquante, à usage unique (`quantiq_demo_wasm.cc:21-60`).
 
-*   [See demos](https://goo.gle/mediapipe-studio)
-*   [Learn more](https://developers.google.com/mediapipe/solutions)
+### Le piège n°1 : `CalculatorGraph` est mono-thread sous Emscripten
 
-## Get started
+Normalement, `CalculatorGraph` orchestre ses nœuds sur plusieurs threads OS. Mais `mediapipe/framework/calculator_graph.cc` force `use_application_thread = true` **inconditionnellement** dès que `__EMSCRIPTEN__` est défini — qu'on compile avec `-pthread` ou non. Tout tourne donc sur le seul thread JS qui a appelé la fonction C++.
 
-You can get started with MediaPipe Solutions by by checking out any of the
-developer guides for
-[vision](https://developers.google.com/mediapipe/solutions/vision/object_detector),
-[text](https://developers.google.com/mediapipe/solutions/text/text_classifier),
-and
-[audio](https://developers.google.com/mediapipe/solutions/audio/audio_classifier)
-tasks. If you need help setting up a development environment for use with
-MediaPipe Tasks, check out the setup guides for
-[Android](https://developers.google.com/mediapipe/solutions/setup_android), [web
-apps](https://developers.google.com/mediapipe/solutions/setup_web), and
-[Python](https://developers.google.com/mediapipe/solutions/setup_python).
+Conséquence directe : le pattern classique `OutputStreamPoller::Next()` (bloquant, "attends que le prochain paquet arrive") **deadlock** systématiquement. Il attend un signal sur sa propre condition variable, mais comme il n'y a pas de second thread pour produire ce signal pendant que le premier est bloqué à l'attendre, rien ne se passe jamais.
 
-## Solutions
+**Solution : `ObserveOutputStream(name, callback)`.** Au lieu d'aller chercher activement le résultat, on enregistre un callback qui sera invoqué **automatiquement, de façon synchrone**, par la boucle de pompage interne du scheduler — cette boucle est elle-même déclenchée par `WaitUntilDone()` (single-shot, Stage 1) ou `WaitUntilIdle()` (streaming continu, Stage 2). C'est ce même thread JS qui exécute tout : pousser le paquet, faire tourner le graphe, invoquer le callback, tout ça en une seule pile d'appels synchrone.
 
-MediaPipe Solutions provides a suite of libraries and tools for you to quickly
-apply artificial intelligence (AI) and machine learning (ML) techniques in your
-applications. You can plug these solutions into your applications immediately,
-customize them to your needs, and use them across multiple development
-platforms. MediaPipe Solutions is part of the MediaPipe [open source
-project](https://github.com/google/mediapipe), so you can further customize the
-solutions code to meet your application needs.
+### Le piège n°2 : le nom du binaire doit matcher partout
 
-These libraries and resources provide the core functionality for each MediaPipe
-Solution:
+`wasm_cc_binary(outputs = ["quantiq_demo.js", "quantiq_demo.wasm"])` — le glue JS généré embarque en dur une référence au nom du fichier `.wasm` d'origine (celui du `cc_binary`). Si les noms divergent, le chargement échoue silencieusement ou avec une erreur peu explicite.
 
-*   **MediaPipe Tasks**: Cross-platform APIs and libraries for deploying
-    solutions. [Learn
-    more](https://developers.google.com/mediapipe/solutions/tasks).
-*   **MediaPipe models**: Pre-trained, ready-to-run models for use with each
-    solution.
+### Build
 
-These tools let you customize and evaluate solutions:
+```bash
+bazel build -c opt //mediapipe/examples/wasm/quantiq_demo:quantiq_demo_wasm
+```
 
-*   **MediaPipe Model Maker**: Customize models for solutions with your data.
-    [Learn more](https://developers.google.com/mediapipe/solutions/model_maker).
-*   **MediaPipe Studio**: Visualize, evaluate, and benchmark solutions in your
-    browser. [Learn
-    more](https://developers.google.com/mediapipe/solutions/studio).
+---
 
-### Legacy solutions
+## 3. Stage 2 — GPU/WebGL, webcam, Worker (`gpu_video_demo/`)
 
-We have ended support for [these MediaPipe Legacy Solutions](https://developers.google.com/mediapipe/solutions/guide#legacy)
-as of March 1, 2023. All other MediaPipe Legacy Solutions will be upgraded to
-a new MediaPipe Solution. See the [Solutions guide](https://developers.google.com/mediapipe/solutions/guide#legacy)
-for details. The [code repository](https://github.com/google/mediapipe/tree/master/mediapipe)
-and prebuilt binaries for all MediaPipe Legacy Solutions will continue to be
-provided on an as-is basis.
+### Fichiers
 
-For more on the legacy solutions, see the [documentation](https://github.com/google/mediapipe/tree/master/docs/solutions).
+- `mediapipe/calculators/quantiq_demo/square_overlay_calculator.cc` — calculateur GPU custom (dessine un carré rouge au centre du flux vidéo, via shader).
+- `mediapipe/examples/wasm/gpu_video_demo/gpu_video_demo_wasm.cc` — le pont Embind, avec état persistant (classe, pas fonction).
+- `mediapipe/examples/wasm/gpu_video_demo/BUILD`
+- `mediapipe/examples/wasm/gpu_video_demo/index.html` — main thread : webcam + affichage.
+- `mediapipe/examples/wasm/gpu_video_demo/worker.js` — Web Worker : héberge tout le module wasm.
 
-## Framework
+### 3.1 Pourquoi WebGL et pas WebGPU
 
-To start using MediaPipe Framework, [install MediaPipe
-Framework](https://developers.google.com/mediapipe/framework/getting_started/install)
-and start building example applications in C++, Android, and iOS.
+WebGPU aurait demandé de vendorer Dawn (l'implémentation de référence) from scratch — aucune trace dans `MODULE.bazel`/`WORKSPACE` — et référence des fichiers C++ fantômes dans ses `BUILD` (absents du disque). WebGL, à l'inverse, a une fondation complète et sans trou : `mediapipe/gpu/gl_context_webgl.cc` implémente déjà tout le nécessaire, et Emscripten fournit GLES/WebGL nativement, sans dépendance externe à ajouter.
 
-[MediaPipe Framework](https://developers.google.com/mediapipe/framework) is the
-low-level component used to build efficient on-device machine learning
-pipelines, similar to the premade MediaPipe Solutions.
+### 3.2 Le graphe
 
-Before using MediaPipe Framework, familiarize yourself with the following key
-[Framework
-concepts](https://developers.google.com/mediapipe/framework/framework_concepts/overview.md):
+Un seul nœud GPU :
 
-*   [Packets](https://developers.google.com/mediapipe/framework/framework_concepts/packets.md)
-*   [Graphs](https://developers.google.com/mediapipe/framework/framework_concepts/graphs.md)
-*   [Calculators](https://developers.google.com/mediapipe/framework/framework_concepts/calculators.md)
+```
+"input_video" -> SquareOverlayCalculator -> "output_video"
+```
 
-## Community
+Contrairement au Stage 1, le graphe est construit **une seule fois** (`Initialize()`) et reste ouvert (`StartRun({})` appelé une fois, jamais `CloseInputStream`/`WaitUntilDone`). Chaque frame vidéo pousse un paquet et draine le graphe avec `WaitUntilIdle()` (drainer une frame sans fermer le graphe — contrairement à `WaitUntilDone()` qui attend la fermeture complète).
 
-*   [Slack community](https://mediapipe.page.link/joinslack) for MediaPipe
-    users.
-*   [Discuss](https://groups.google.com/forum/#!forum/mediapipe) - General
-    community discussion around MediaPipe.
-*   [Awesome MediaPipe](https://mediapipe.page.link/awesome-mediapipe) - A
-    curated list of awesome MediaPipe related frameworks, libraries and
-    software.
+### 3.3 Le cycle de vie C++, exposé comme une classe Embind
 
-## Contributing
+```cpp
+class GpuVideoDemo {
+ public:
+  std::string Initialize();
+  emscripten::val ProcessFrame(emscripten::val rgba, int width, int height);
+ private:
+  absl::Status ReadBackFrame(const GpuBuffer& gpu_frame);
+  CalculatorGraph graph_;
+  GlCalculatorHelper gpu_helper_;
+  std::vector<uint8_t> output_buffer_;
+};
+```
 
-We welcome contributions. Please follow these
-[guidelines](https://github.com/google/mediapipe/blob/master/CONTRIBUTING.md).
+Côté JS : `new Module.GpuVideoDemo()` → `.initialize()` → `.processFrame(...)` en boucle, une fois par frame.
 
-We use GitHub issues for tracking requests and bugs. Please post questions to
-the MediaPipe Stack Overflow with a `mediapipe` tag.
+**`Initialize()`** (`gpu_video_demo_wasm.cc:49-75`) :
+1. Parse le graphe (texte proto inline).
+2. `GpuResources::Create()` — crée le contexte WebGL (voir 3.4 ci-dessous) et l'attache au graphe.
+3. `gpu_helper_.InitializeForTest(...)` — initialise l'assistant GL local à notre classe.
+4. `graph_.ObserveOutputStream("output_video", callback)` — enregistre le lecteur de sortie (même pattern que Stage 1).
+5. `graph_.StartRun({})` — démarre le graphe, qui reste actif indéfiniment.
 
-## Privacy Notice
+**`ProcessFrame(rgba, width, height)`** (`gpu_video_demo_wasm.cc:83-108`), appelée à chaque frame :
+1. `emscripten::vecFromJSArray<uint8_t>(rgba)` — copie le `Uint8Array` JS (RGBA brut) dans un `std::vector` C++.
+2. Construit un `ImageFrame` CPU à partir de ces pixels.
+3. `gpu_helper_.RunInGlContext([...])` — bascule sur le contexte GL dédié pour : uploader l'`ImageFrame` en texture GPU (`CreateSourceTexture`), récupérer un `GpuBuffer` qui la référence, et pousser ce buffer comme paquet d'entrée du graphe.
+4. `graph_.WaitUntilIdle()` — fait tourner le graphe pour cette frame : le shader du `SquareOverlayCalculator` s'exécute sur GPU, le résultat sort sur `"output_video"`, ce qui invoque **synchroniquement** le callback `ReadBackFrame` (étape 5 ci-dessous), avant que `WaitUntilIdle()` ne retourne.
+5. `ReadBackFrame(gpu_frame)` (`gpu_video_demo_wasm.cc:111-124`) : re-bascule sur le contexte GL, lie le framebuffer sur la texture de sortie, et fait un `glReadPixels` — copie GPU→CPU dans `output_buffer_`.
+6. `ProcessFrame` retourne `emscripten::typed_memory_view(...)` — une **vue** (pas une copie) sur `output_buffer_`, directement dans la mémoire linéaire wasm. Le JS appelant doit la consommer immédiatement (avant toute autre allocation wasm), sinon `ALLOW_MEMORY_GROWTH` pourrait invalider la vue.
 
-Last modified: June 5, 2026
+### 3.4 Le contexte WebGL et le sélecteur de canvas `"#canvas"`
 
-When you use MediaPipe Tasks, processing of the input data (e.g. images, video,
-text) takes place on device, and MediaPipe does not send that input data to
-Google servers. As a result, you can use our MediaPipe Tasks APIs for
-processing data that should not leave the device.
+`GpuResources::Create()` appelle en interne `GlContext::Create(...)`, qui sous Emscripten (`mediapipe/gpu/gl_context_webgl.cc`) fait :
 
-MediaPipe Tasks APIs send metrics about the performance and utilization of the
-APIs in your app to Google. Google uses this metrics data to measure
-performance, usage, debug, maintain and improve the MediaPipe Tasks, as further
-described in our [Privacy Policy](https://policies.google.com/privacy).
+```cpp
+emscripten_webgl_create_context("#canvas", &attrs);
+```
 
-**You are responsible for obtaining informed consent from your app users about
-Google's processing of MediaPipe metrics data as required by applicable law.**
+Le sélecteur `"#canvas"` est en dur, mais mappé côté JS via :
 
-## Resources
+```js
+EM_ASM({ specialHTMLTargets["#canvas"] = Module.canvas; });
+```
 
-### Publications
+**`Module.canvas` doit donc être assigné avant tout appel qui déclenche `GpuResources::Create()`.** C'est ce qui explique pourquoi, dans `worker.js`, on fait :
 
-*   [Bringing artworks to life with AR](https://developers.googleblog.com/2021/07/bringing-artworks-to-life-with-ar.html)
-    in Google Developers Blog
-*   [Prosthesis control via Mirru App using MediaPipe hand tracking](https://developers.googleblog.com/2021/05/control-your-mirru-prosthesis-with-mediapipe-hand-tracking.html)
-    in Google Developers Blog
-*   [SignAll SDK: Sign language interface using MediaPipe is now available for
-    developers](https://developers.googleblog.com/2021/04/signall-sdk-sign-language-interface-using-mediapipe-now-available.html)
-    in Google Developers Blog
-*   [MediaPipe Holistic - Simultaneous Face, Hand and Pose Prediction, on
-    Device](https://ai.googleblog.com/2020/12/mediapipe-holistic-simultaneous-face.html)
-    in Google AI Blog
-*   [Background Features in Google Meet, Powered by Web ML](https://ai.googleblog.com/2020/10/background-features-in-google-meet.html)
-    in Google AI Blog
-*   [MediaPipe 3D Face Transform](https://developers.googleblog.com/2020/09/mediapipe-3d-face-transform.html)
-    in Google Developers Blog
-*   [Instant Motion Tracking With MediaPipe](https://developers.googleblog.com/2020/08/instant-motion-tracking-with-mediapipe.html)
-    in Google Developers Blog
-*   [BlazePose - On-device Real-time Body Pose Tracking](https://ai.googleblog.com/2020/08/on-device-real-time-body-pose-tracking.html)
-    in Google AI Blog
-*   [MediaPipe Iris: Real-time Eye Tracking and Depth Estimation](https://ai.googleblog.com/2020/08/mediapipe-iris-real-time-iris-tracking.html)
-    in Google AI Blog
-*   [MediaPipe KNIFT: Template-based feature matching](https://developers.googleblog.com/2020/04/mediapipe-knift-template-based-feature-matching.html)
-    in Google Developers Blog
-*   [Alfred Camera: Smart camera features using MediaPipe](https://developers.googleblog.com/2020/03/alfred-camera-smart-camera-features-using-mediapipe.html)
-    in Google Developers Blog
-*   [Real-Time 3D Object Detection on Mobile Devices with MediaPipe](https://ai.googleblog.com/2020/03/real-time-3d-object-detection-on-mobile.html)
-    in Google AI Blog
-*   [AutoFlip: An Open Source Framework for Intelligent Video Reframing](https://ai.googleblog.com/2020/02/autoflip-open-source-framework-for.html)
-    in Google AI Blog
-*   [MediaPipe on the Web](https://developers.googleblog.com/2020/01/mediapipe-on-web.html)
-    in Google Developers Blog
-*   [Object Detection and Tracking using MediaPipe](https://developers.googleblog.com/2019/12/object-detection-and-tracking-using-mediapipe.html)
-    in Google Developers Blog
-*   [On-Device, Real-Time Hand Tracking with MediaPipe](https://ai.googleblog.com/2019/08/on-device-real-time-hand-tracking-with.html)
-    in Google AI Blog
-*   [MediaPipe: A Framework for Building Perception Pipelines](https://arxiv.org/abs/1906.08172)
+```js
+const Module = await GpuVideoDemoModule({ canvas: msg.canvas });
+```
 
-### Videos
+`msg.canvas` peut être un vrai `<canvas>` DOM **ou** un `OffscreenCanvas` transféré — les deux fonctionnent, ce qui est la clé de l'architecture Worker (section 3.6).
 
-*   [YouTube Channel](https://www.youtube.com/c/MediaPipe)
+### 3.5 Le shader : comment un calculateur GPU custom fonctionne
+
+`SquareOverlayCalculator` hérite de `GlSimpleCalculator` (`mediapipe/gpu/gl_simple_calculator.h`), une classe de base qui gère toute la plomberie (`Open`/`Process`/`Close`, création/liaison de texture, framebuffer) — la sous-classe n'a qu'à fournir trois méthodes :
+
+- `GlSetup()` — compile le shader une fois (`GlhCreateProgram`).
+- `GlRender(src, dst)` — dessine, appelé à chaque frame.
+- `GlTeardown()` — libère le programme GL.
+
+Le fragment shader (`square_overlay_calculator.cc:37-73`) est exécuté **en parallèle, pixel par pixel, sur le GPU**. Pour chaque pixel, `sample_coordinate` contient sa position normalisée (0 à 1) dans l'image ; le shader compare sa distance au centre `(0.5, 0.5)` à un seuil (`kSquareHalfSize = 0.15`) et choisit soit la couleur rouge unie, soit le pixel de la vidéo source échantillonné via `texture2D(video_frame, sample_coordinate)`. Aucune boucle explicite sur les pixels en C++ : c'est le modèle d'exécution GPU qui parallélise ça nativement.
+
+`GlRender` (lignes 82-128) fait le "plumbing" classique OpenGL : deux triangles couvrant tout l'écran (`GL_TRIANGLE_STRIP`, 4 sommets), un VBO pour les positions, un pour les coordonnées de texture, puis `glDrawArrays` déclenche l'exécution du shader sur chaque pixel du framebuffer cible.
+
+### 3.6 Architecture Web Worker
+
+Le module wasm entier (graphe MediaPipe + contexte WebGL) tourne **dans un Worker**, pas sur le thread JS principal — ainsi la page reste réactive (scroll, interactions) même si le traitement GPU/CPU par frame prend du temps.
+
+**Important : ceci n'a rien à voir avec `-pthread`/multithreading Emscripten.** Un seul Worker héberge un module Emscripten **mono-thread** (comme il l'est de toute façon sous Emscripten, cf. piège n°1) — il s'exécute juste sur le thread de ce Worker plutôt que sur le thread principal de la page. Pas besoin de `SharedArrayBuffer` ni des en-têtes `COOP`/`COEP` que `-pthread` exigerait.
+
+Flux de données par frame (voir `index.html` + `worker.js`) :
+
+1. **Main thread** (`index.html`) : dessine la frame vidéo courante (`<video>`) sur un `<canvas>` caché, puis `createImageBitmap(sourceCanvas)` — capture un instantané transférable, sans copie.
+2. `worker.postMessage({type:"frame", bitmap, width, height}, [bitmap])` — transfert **zero-copy** (le `bitmap` change de propriétaire, pas de copie mémoire).
+3. **Worker** (`worker.js`) : dessine le `bitmap` sur un canvas de travail (`OffscreenCanvas`), `getImageData()` pour récupérer les pixels bruts, puis `demo.processFrame(data, width, height)` — tout le pipeline C++/GPU de la section 3.3 s'exécute ici, sur ce thread.
+4. Le résultat (vue mémoire wasm) est copié dans un `ArrayBuffer` neuf (`new Uint8Array(result).buffer`) — copie obligatoire, on ne peut pas transférer la mémoire du module wasm lui-même sans la détacher.
+5. `self.postMessage({type:"result", buffer, width, height}, [outBuffer])` — retour vers le main thread, encore zero-copy.
+6. **Main thread** : `outputCtx.putImageData(...)` affiche le résultat.
+
+**Backpressure** : un flag `frameInFlight` empêche d'envoyer une nouvelle frame au Worker tant que la précédente n'est pas revenue — sinon, si `processFrame` est plus lent que le taux de `requestAnimationFrame`, les messages s'empileraient indéfiniment.
+
+Build : le seul changement nécessaire par rapport au Stage 1 a été le linkopt `-sENVIRONMENT=web,worker` (au lieu de `-sENVIRONMENT=web`), pour que le glue JS généré fonctionne correctement chargé via `importScripts()` dans un Worker plutôt que comme `<script>` classique.
+
+### Build
+
+```bash
+bazel build -c opt //mediapipe/examples/wasm/gpu_video_demo:gpu_video_demo_wasm
+```
+
+Les artefacts (`gpu_video_demo.js`, `gpu_video_demo.wasm`) sont générés en lecture seule dans `bazel-bin/` — pour les servir localement, les copier (avec `chmod u+w`) dans un répertoire à part avec `index.html`/`worker.js`, puis :
+
+```bash
+python3 -m http.server 8080 --directory /chemin/vers/le/dossier
+```
+
+### État connu, non résolu
+
+À 720p, le pipeline tourne à ~6 FPS. Le goulot d'étranglement suspecté est `glReadPixels` (étape 3.3.5) — un stall synchrone qui force le GPU à finir tout son travail en attente avant de rendre la main au CPU. Une tentative de rendu direct-à-l'écran (via `mediapipe::QuadRenderer`, en éliminant le readback CPU) a cassé l'affichage et a été annulée sans diagnostic root-cause — à reprendre avec instrumentation avant de retenter.
+
+---
+
+## 4. Récapitulatif des concepts clés
+
+| Concept | Où | Pourquoi |
+|---|---|---|
+| `ObserveOutputStream` au lieu d'`OutputStreamPoller` | Stage 1 + 2 | Un poller bloquant deadlock sous Emscripten (mono-thread forcé) |
+| `WaitUntilDone()` vs `WaitUntilIdle()` | Stage 1 vs Stage 2 | Single-shot fermé vs streaming continu, graphe jamais fermé |
+| `Module.canvas` avant `GpuResources::Create()` | Stage 2 | `gl_context_webgl.cc` mappe `"#canvas"` sur `Module.canvas` en dur |
+| `emscripten::typed_memory_view` | Stage 2 | Retourne une vue mémoire (pas une copie) — à consommer immédiatement côté JS |
+| `-sENVIRONMENT=web,worker` | Stage 2 | Nécessaire pour charger le glue JS via `importScripts()` dans un Worker |
+| Un seul Worker suffit, pas besoin de `-pthread` | Stage 2 | Le graphe MediaPipe est déjà mono-thread sous Emscripten de toute façon |
+| Nom du `cc_binary` = nom des `outputs` du `wasm_cc_binary` | Stage 1 + 2 | Le glue JS référence en dur le nom du fichier `.wasm` d'origine |
