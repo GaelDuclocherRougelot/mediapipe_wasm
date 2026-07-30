@@ -227,6 +227,36 @@ Validé de bout en bout : `initialize()` réussit sans hang, un `std::thread` r�
 
 **Leçon générale** : dès qu'un module Emscripten `-pthread` est chargé autrement que comme script d'entrée direct d'un Worker (via `importScripts()` dans un Worker custom, un bundler, un blob, etc.), l'auto-détection de l'URL du script pour spawner de nouveaux pthreads peut se tromper silencieusement. Toujours fournir `Module['mainScriptUrlOrBlob']` explicitement dans ce genre d'architecture hôte custom.
 
+### 3.9 Preuve de concept : du vrai travail CPU en parallèle (`pthread_sort_demo/`)
+
+La section 3.8 prouve que la création de threads fonctionne ; elle ne prouve pas encore qu'un vrai travail CPU tourne **en parallèle** avec un gain de perf mesurable. `mediapipe/examples/wasm/pthread_sort_demo/` comble ce trou : un exemple autonome, **sans aucune dépendance MediaPipe** (juste la lib standard C++ + Embind), qui trie le même tableau aléatoire de deux façons et chronomètre les deux :
+
+- **Mono-thread** : `std::sort` classique sur tout le tableau.
+- **Multi-thread** : le tableau est découpé en `N` tranches contiguës ; chaque tranche est triée par son propre `std::thread` (tous partagent la même mémoire linéaire wasm, via `SharedArrayBuffer` — c'est ce que `-pthread` fournit concrètement) ; une fois les `N` threads joints, une fusion (`std::inplace_merge` en cascade façon tri fusion) reconstitue l'ordre global.
+
+**Résultat mesuré** (20 000 000 entiers, 8 threads, Chrome) :
+
+```
+size=20000000 numThreads=8
+single-threaded std::sort: 3485.52 ms (sorted=1)
+multi-threaded (8 threads) sort+merge: 924.38 ms (sorted=1)
+speedup: 3.77066x
+```
+
+Les deux résultats sont correctement triés (`sorted=1`) — ce n'est pas juste "ça ne plante pas", c'est un vrai gain de perf sur du travail réel.
+
+**Pourquoi ~3.8x et pas 8x avec 8 threads** (attendu, pas un problème) :
+1. La fusion finale reste **entièrement séquentielle** — seul le tri des tranches est parallélisé, la fusion ajoute un coût non parallélisé qui plafonne le gain global. La paralléliser complètement demanderait un algorithme de fusion parallèle (split par rang via recherche binaire), plus complexe.
+2. Le tri est **memory-bound**, pas purement CPU-bound — les threads se partagent la même bande passante mémoire, donc la scalabilité linéaire avec le nombre de cœurs n'est jamais atteinte en pratique, même en C++ natif hors navigateur.
+
+**Build** : ne nécessite **pas** les flags globaux `--copt=-pthread --linkopt=-pthread` (contrairement à `gpu_video_demo/`) — sans dépendance MediaPipe à recompiler, les `copts`/`linkopts` `-pthread` locaux à la cible suffisent :
+
+```bash
+bazel build -c opt //mediapipe/examples/wasm/pthread_sort_demo:pthread_sort_demo_wasm
+```
+
+Ce contraste confirme que l'exigence de flags globaux (section 3.8) vient bien de la nécessité de recompiler tout l'arbre de dépendances transitif avec les mêmes features `atomics`/`bulk-memory`, pas d'une propriété intrinsèque de `-pthread`. Se sert avec le même `serve_coop_coep.py` (COOP/COEP requis pour `SharedArrayBuffer`).
+
 ---
 
 ## 4. Récapitulatif des concepts clés
@@ -242,3 +272,4 @@ Validé de bout en bout : `initialize()` réussit sans hang, un `std::thread` r�
 | Nom du `cc_binary` = nom des `outputs` du `wasm_cc_binary` | Stage 1 + 2 | Le glue JS référence en dur le nom du fichier `.wasm` d'origine |
 | `TypedArray.set()` plutôt que `vecFromJSArray` pour du binaire volumineux | Stage 2 | `vecFromJSArray` marshale élément par élément — ~31x plus lent qu'un memcpy natif sur une frame vidéo |
 | `mainScriptUrlOrBlob` explicite si le glue Emscripten est chargé via `importScripts()` dans un Worker custom | Stage 2 (`-pthread`) | Sans lui, l'auto-détection d'URL pour spawner un pthread résout l'URL du Worker hôte, pas celle du glue — hang silencieux |
+| `-pthread` produit un vrai gain de perf mesuré (~3.8x/8 threads), pas juste "ça ne plante pas" | `pthread_sort_demo/` | N `std::thread` partageant la même mémoire wasm (`SharedArrayBuffer`) trient des tranches en parallèle ; le speedup n'est pas linéaire à cause de la fusion séquentielle et de la bande passante mémoire partagée |
