@@ -148,7 +148,7 @@ Le fragment shader (`square_overlay_calculator.cc:37-73`) est exécuté **en par
 
 Le module wasm entier (graphe MediaPipe + contexte WebGL) tourne **dans un Worker**, pas sur le thread JS principal — ainsi la page reste réactive (scroll, interactions) même si le traitement GPU/CPU par frame prend du temps.
 
-**Important : ceci n'a rien à voir avec `-pthread`/multithreading Emscripten.** Un seul Worker héberge un module Emscripten **mono-thread** (comme il l'est de toute façon sous Emscripten, cf. piège n°1) — il s'exécute juste sur le thread de ce Worker plutôt que sur le thread principal de la page. Pas besoin de `SharedArrayBuffer` ni des en-têtes `COOP`/`COEP` que `-pthread` exigerait.
+**Important : ceci n'a rien à voir avec `-pthread`/multithreading Emscripten.** Un seul Worker héberge un module Emscripten mono-thread par défaut (comme il l'est de toute façon sous Emscripten côté scheduling MediaPipe, cf. piège n°1) — il s'exécute juste sur le thread de ce Worker plutôt que sur le thread principal de la page. Pas besoin de `SharedArrayBuffer` ni des en-têtes `COOP`/`COEP` pour ce mode. Si un calculator a besoin de vrai threading C++ interne (`std::thread`), voir la section 3.8 — `-pthread` fonctionne bien dans cette architecture, à condition d'un correctif précis.
 
 Flux de données par frame (voir `index.html` + `worker.js`) :
 
@@ -165,14 +165,18 @@ Build : le seul changement nécessaire par rapport au Stage 1 a été le linkopt
 
 ### Build
 
+`-pthread` étant activé dans les `linkopts` de la cible (section 3.8), il faut aussi le passer en flags Bazel globaux — sinon la cause racine devient un échec de lien plus simple (`--shared-memory is disallowed by ... because it was not compiled with 'atomics' or 'bulk-memory' features`), car toute la chaîne de dépendances transitives (framework MediaPipe, protobuf, abseil...) doit être recompilée avec les mêmes features :
+
 ```bash
-bazel build -c opt //mediapipe/examples/wasm/gpu_video_demo:gpu_video_demo_wasm
+bazel build -c opt --copt=-pthread --linkopt=-pthread //mediapipe/examples/wasm/gpu_video_demo:gpu_video_demo_wasm
 ```
 
-Les artefacts (`gpu_video_demo.js`, `gpu_video_demo.wasm`) sont générés en lecture seule dans `bazel-bin/` — pour les servir localement, les copier (avec `chmod u+w`) dans un répertoire à part avec `index.html`/`worker.js`, puis :
+Les artefacts (`gpu_video_demo.js`, `gpu_video_demo.wasm`) sont générés en lecture seule dans `bazel-bin/` — pour les servir localement, les copier (avec `chmod u+w`) dans un répertoire à part avec `index.html`/`worker.js`.
+
+**`-pthread` exige `SharedArrayBuffer`, donc un serveur qui envoie les en-têtes `Cross-Origin-Opener-Policy: same-origin` et `Cross-Origin-Embedder-Policy: require-corp`** — un `python3 -m http.server` classique ne les envoie pas. `serve_coop_coep.py`, dans ce même répertoire, les ajoute :
 
 ```bash
-python3 -m http.server 8080 --directory /chemin/vers/le/dossier
+python3 mediapipe/examples/wasm/gpu_video_demo/serve_coop_coep.py /chemin/vers/le/dossier 8080
 ```
 
 ### 3.7 Optimisation résolue : le vrai goulot n'était pas le GPU
@@ -202,6 +206,27 @@ Résultat : `processFrame` est passé de ~266ms à ~8.5ms (gain ~31x), largement
 
 **Leçon générale** : `emscripten::vecFromJSArray` est adapté à de petits tableaux, mais catastrophique pour du binaire volumineux (frames vidéo, buffers audio, etc.). Pour tout transfert de données brutes JS→wasm de taille significative, préférer un buffer wasm persistant + `TypedArray.set()` côté JS plutôt que les helpers de conversion génériques d'Embind.
 
+### 3.8 Multithreading réel (`-pthread`) : ça marche, avec un correctif précis
+
+Le graphe MediaPipe reste et restera toujours mono-thread côté scheduling sous Emscripten (`use_application_thread=true` inconditionnel, cf. piège n°1) — `-pthread` ne change rien à ça. Ce qu'il permet, en revanche, c'est du **vrai threading C++ interne à un calculator** (un `std::thread` manuel dans son implémentation), utile pour paralléliser un traitement lourd à l'intérieur d'un seul nœud du graphe.
+
+**Symptôme initial** : en activant `-pthread` (flags globaux Bazel `--copt=-pthread --linkopt=-pthread` + `-sUSE_PTHREADS=1 -sPTHREAD_POOL_SIZE=N` côté `BUILD`), la page restait bloquée indéfiniment sur "Starting worker...", sans aucune erreur console — reproduit à l'identique avec un pool pré-spawné et avec la création d'un thread à la demande. Seul `PTHREAD_POOL_SIZE=0` (aucun thread jamais créé) fonctionnait.
+
+**Cause racine** (trouvée par lecture directe du glue Emscripten généré, pas déduite) : quand un pthread doit être spawné, `libpthread.js` (`allocateUnusedWorker()`) fait `new Worker(pthreadMainJs)`, où `pthreadMainJs` vient par défaut de `_scriptName`. Or `_scriptName` est déterminé, dans un Worker, par `self.location.href` — et comme `gpu_video_demo.js` est chargé via `importScripts()` **à l'intérieur** de notre propre `worker.js` (même global scope), `self.location.href` vaut l'URL de **`worker.js`**, pas celle du glue compilé. Emscripten spawnait donc un nouveau Worker qui rechargeait `worker.js` depuis zéro, lequel attendait un message `{type:"init"|"frame"}` qui n'arrivait jamais du protocole interne pthread → hang silencieux.
+
+**Correction** (`worker.js`) : fournir explicitement `mainScriptUrlOrBlob` à l'instanciation du module, pour court-circuiter cette détection automatique cassée :
+
+```js
+const Module = await GpuVideoDemoModule({
+  canvas: msg.canvas,
+  mainScriptUrlOrBlob: "gpu_video_demo.js",
+});
+```
+
+Validé de bout en bout : `initialize()` réussit sans hang, un `std::thread` réel créé/exécuté/joint depuis C++ fonctionne (testé via une méthode `TestThread()` temporaire), et le pipeline webcam + carré GPU reste fluide — aucune régression.
+
+**Leçon générale** : dès qu'un module Emscripten `-pthread` est chargé autrement que comme script d'entrée direct d'un Worker (via `importScripts()` dans un Worker custom, un bundler, un blob, etc.), l'auto-détection de l'URL du script pour spawner de nouveaux pthreads peut se tromper silencieusement. Toujours fournir `Module['mainScriptUrlOrBlob']` explicitement dans ce genre d'architecture hôte custom.
+
 ---
 
 ## 4. Récapitulatif des concepts clés
@@ -213,6 +238,7 @@ Résultat : `processFrame` est passé de ~266ms à ~8.5ms (gain ~31x), largement
 | `Module.canvas` avant `GpuResources::Create()` | Stage 2 | `gl_context_webgl.cc` mappe `"#canvas"` sur `Module.canvas` en dur |
 | `emscripten::typed_memory_view` | Stage 2 | Retourne une vue mémoire (pas une copie) — à consommer immédiatement côté JS |
 | `-sENVIRONMENT=web,worker` | Stage 2 | Nécessaire pour charger le glue JS via `importScripts()` dans un Worker |
-| Un seul Worker suffit, pas besoin de `-pthread` | Stage 2 | Le graphe MediaPipe est déjà mono-thread sous Emscripten de toute façon |
+| Un seul Worker suffit, pas besoin de `-pthread` pour faire tourner le graphe hors du thread principal | Stage 2 | Le graphe MediaPipe est déjà mono-thread côté scheduling sous Emscripten de toute façon |
 | Nom du `cc_binary` = nom des `outputs` du `wasm_cc_binary` | Stage 1 + 2 | Le glue JS référence en dur le nom du fichier `.wasm` d'origine |
 | `TypedArray.set()` plutôt que `vecFromJSArray` pour du binaire volumineux | Stage 2 | `vecFromJSArray` marshale élément par élément — ~31x plus lent qu'un memcpy natif sur une frame vidéo |
+| `mainScriptUrlOrBlob` explicite si le glue Emscripten est chargé via `importScripts()` dans un Worker custom | Stage 2 (`-pthread`) | Sans lui, l'auto-détection d'URL pour spawner un pthread résout l'URL du Worker hôte, pas celle du glue — hang silencieux |

@@ -16,7 +16,19 @@ self.onmessage = async (e) => {
 
   if (msg.type === "init") {
     try {
-      const Module = await GpuVideoDemoModule({ canvas: msg.canvas });
+      // Without this, Emscripten's pthread bootstrap (libpthread.js,
+      // allocateUnusedWorker) resolves its own script URL via
+      // self.location.href, which -- because this file was reached via
+      // importScripts() rather than being the Worker's own entry script --
+      // still points at worker.js instead of gpu_video_demo.js. Every new
+      // pthread Worker then reloads worker.js from scratch and waits for a
+      // {type:"init"|"frame"} message that never comes, hanging forever
+      // with no console error. Providing mainScriptUrlOrBlob explicitly
+      // bypasses that broken auto-detection.
+      const Module = await GpuVideoDemoModule({
+        canvas: msg.canvas,
+        mainScriptUrlOrBlob: "gpu_video_demo.js",
+      });
       demo = new Module.GpuVideoDemo();
       const initResult = demo.initialize();
       console.log("[worker] initialize() result:", initResult);
