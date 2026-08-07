@@ -5,20 +5,42 @@
     <title>Quantiq GPU Video Demo (WebGL, off main thread)</title>
   </head>
   <body>
-    <p id="status">Starting worker...</p>
+    <p id="status">Starting worker pool...</p>
+
+    <div>
+      Workers:
+      <input type="number" id="workers" min="1" value="1" style="width: 4em" />
+      (navigator.hardwareConcurrency = <span id="cores"></span>)
+      <button id="apply-workers" disabled>Apply</button>
+      <span id="pool-status"></span>
+    </div>
     <p id="fps"></p>
+
     <div>
       <p>Source (webcam):</p>
       <canvas id="source-canvas" width="320" height="240"></canvas>
     </div>
     <div>
-      <p>Output (red square overlay, produced by SquareOverlayCalculator on GPU, running in a Worker):</p>
+      <p>Output (red square overlay, produced by SquareOverlayCalculator on GPU, running in a worker pool):</p>
       <canvas id="output-canvas" width="320" height="240"></canvas>
     </div>
     <!-- The actual <video> element receiving the camera stream. Hidden:
          frames are drawn into source-canvas every rAF tick instead. -->
     <video id="webcam-video" autoplay playsinline muted style="display: none"></video>
 
+    <h3>Benchmark (burst, off the live stream)</h3>
+    <p>
+      Processes a single captured frame repeatedly, back-to-back, distributed across the
+      current worker pool -- not gated by rAF/webcam framerate like the live view above, so it
+      isolates the real per-frame compute cost and shows the actual parallel speedup.
+    </p>
+    <div>
+      Frames: <input id="bench-frames" type="number" value="100" min="1" style="width: 6em" />
+      <button id="bench-run" disabled>Run benchmark</button>
+    </div>
+    <pre id="bench-output"></pre>
+
+    <script src="worker-pool.js"></script>
     <script>
       const statusEl = document.getElementById("status");
       const fpsEl = document.getElementById("fps");
@@ -27,50 +49,72 @@
       const outputCanvas = document.getElementById("output-canvas");
       const sourceCtx = sourceCanvas.getContext("2d", { willReadFrequently: true });
       const outputCtx = outputCanvas.getContext("2d");
+      const workersInput = document.getElementById("workers");
+      const applyWorkersBtn = document.getElementById("apply-workers");
+      const poolStatusEl = document.getElementById("pool-status");
+      const benchFramesInput = document.getElementById("bench-frames");
+      const benchRunBtn = document.getElementById("bench-run");
+      const benchOutputEl = document.getElementById("bench-output");
+
+      document.getElementById("cores").textContent = navigator.hardwareConcurrency;
 
       let width = 0;
       let height = 0;
       let frameCount = 0;
       let lastFpsUpdate = performance.now();
-      let frameInFlight = false;
+      let lastDisplayedSeq = 0;
+      let benchmarkRunning = false;
 
-      const worker = new Worker("worker.js");
+      const pool = new WorkerPool();
 
-      worker.onmessage = (e) => {
-        const msg = e.data;
-        if (msg.type === "ready") {
-          statusEl.textContent =
-            "Worker ready (GPU graph initialized off the main thread). Requesting webcam...";
-          startWebcam();
-        } else if (msg.type === "result") {
-          const outImageData = new ImageData(
-            new Uint8ClampedArray(msg.buffer),
-            msg.width,
-            msg.height
-          );
-          outputCtx.putImageData(outImageData, 0, 0);
-          frameInFlight = false;
+      pool.onResult = (msg) => {
+        // Workers can finish out of order when several run concurrently;
+        // ignore anything older than what's already on screen so the video
+        // never visibly jumps backwards in time.
+        if (msg.seq <= lastDisplayedSeq) return;
+        lastDisplayedSeq = msg.seq;
 
-          frameCount++;
-          const now = performance.now();
-          if (now - lastFpsUpdate >= 1000) {
-            fpsEl.textContent = "FPS: " + frameCount;
-            frameCount = 0;
-            lastFpsUpdate = now;
-          }
-        } else if (msg.type === "error") {
-          statusEl.textContent = "Worker error: " + msg.message;
-          console.error(msg.message);
+        const outImageData = new ImageData(
+          new Uint8ClampedArray(msg.buffer),
+          msg.width,
+          msg.height
+        );
+        outputCtx.putImageData(outImageData, 0, 0);
+
+        frameCount++;
+        const now = performance.now();
+        if (now - lastFpsUpdate >= 1000) {
+          fpsEl.textContent = `FPS: ${frameCount} (workers busy: ${pool.busyCount()}/${pool.size})`;
+          frameCount = 0;
+          lastFpsUpdate = now;
         }
       };
 
-      // Kick off GL context / graph init inside the worker, handing it a
-      // standalone OffscreenCanvas -- this canvas backs the WebGL context
-      // gl_context_webgl.cc creates (hardcoded "#canvas" target -> Module.canvas)
-      // but its own size is irrelevant to per-frame processing, since
-      // MediaPipe renders into its own framebuffers/textures sized per call.
-      const glCanvas = new OffscreenCanvas(320, 240);
-      worker.postMessage({ type: "init", canvas: glCanvas }, [glCanvas]);
+      async function applyWorkerCount() {
+        let n = parseInt(workersInput.value, 10);
+        if (!Number.isFinite(n) || n < 1) n = 1;
+        workersInput.value = n;
+
+        applyWorkersBtn.disabled = true;
+        benchRunBtn.disabled = true;
+        poolStatusEl.textContent = "Rebuilding pool...";
+        try {
+          await pool.rebuild(n);
+          let msg = `Pool ready (${n} worker${n > 1 ? "s" : ""}).`;
+          if (n > navigator.hardwareConcurrency) {
+            msg += ` Note: exceeds navigator.hardwareConcurrency=${navigator.hardwareConcurrency}.`;
+          }
+          poolStatusEl.textContent = msg;
+          benchRunBtn.disabled = benchmarkRunning;
+        } catch (err) {
+          poolStatusEl.textContent = "Pool init failed: " + err.message;
+          console.error(err);
+        } finally {
+          applyWorkersBtn.disabled = benchmarkRunning;
+        }
+      }
+
+      applyWorkersBtn.addEventListener("click", applyWorkerCount);
 
       async function startWebcam() {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -91,25 +135,93 @@
         outputCanvas.width = width;
         outputCanvas.height = height;
         statusEl.textContent =
-          "Running (" + width + "x" + height + ") -- wasm running in a Worker";
-        requestAnimationFrame(tick);
+          "Running (" + width + "x" + height + ") -- wasm running in a worker pool";
       }
 
       async function tick() {
         sourceCtx.drawImage(video, 0, 0, width, height);
 
-        // Simple backpressure: only have one frame in flight to the worker
-        // at a time, so a slow processFrame() doesn't queue up a growing
-        // backlog of postMessage calls. The visible source preview above
-        // still refreshes every rAF regardless.
-        if (!frameInFlight) {
-          frameInFlight = true;
+        if (!benchmarkRunning && pool.hasFreeWorker()) {
           const bitmap = await createImageBitmap(sourceCanvas);
-          worker.postMessage({ type: "frame", bitmap, width, height }, [bitmap]);
+          pool.dispatchFrame(bitmap, width, height);
         }
 
         requestAnimationFrame(tick);
       }
+
+      benchRunBtn.addEventListener("click", async () => {
+        const totalFrames = parseInt(benchFramesInput.value, 10) || 0;
+        if (totalFrames < 1 || pool.size < 1 || !width || !height) return;
+
+        benchmarkRunning = true;
+        benchRunBtn.disabled = true;
+        applyWorkersBtn.disabled = true;
+        benchOutputEl.textContent = "Capturing reference frame...";
+        // Yield one frame so the "disabled"/"Capturing..." state actually
+        // paints before the burst below keeps the event loop busy.
+        await new Promise(requestAnimationFrame);
+
+        // One reference frame, reused for every repeat -- content doesn't
+        // matter for a throughput measurement, and reusing it avoids
+        // re-capturing from the (possibly slow) webcam mid-benchmark.
+        const bitmap = await createImageBitmap(sourceCanvas);
+        const captureCanvas = new OffscreenCanvas(width, height);
+        const captureCtx = captureCanvas.getContext("2d");
+        captureCtx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        const { data } = captureCtx.getImageData(0, 0, width, height);
+
+        const n = pool.size;
+        const counts = new Array(n).fill(0);
+        for (let i = 0; i < totalFrames; i++) counts[i % n]++;
+
+        try {
+          // Phase 1: single-worker baseline, reusing workers[0] of the
+          // current pool (no extra spawn cost).
+          benchOutputEl.textContent = "Running 1-worker baseline...";
+          const t0 = performance.now();
+          await pool.runBenchmarkDistributed([totalFrames], data, width, height);
+          const singleMs = performance.now() - t0;
+
+          // Phase 2: same total workload spread across all n workers.
+          benchOutputEl.textContent = `Running ${n}-worker burst...`;
+          const t1 = performance.now();
+          await pool.runBenchmarkDistributed(counts, data, width, height);
+          const multiMs = performance.now() - t1;
+
+          const speedup = singleMs / multiMs;
+          benchOutputEl.textContent =
+            `frames=${totalFrames} workers=${n}\n` +
+            `1 worker:   ${singleMs.toFixed(1)} ms (${(totalFrames / (singleMs / 1000)).toFixed(1)} fps)\n` +
+            `${n} worker${n > 1 ? "s" : ""}: ${multiMs.toFixed(1)} ms (${(totalFrames / (multiMs / 1000)).toFixed(1)} fps)\n` +
+            `speedup: ${speedup.toFixed(2)}x`;
+        } catch (err) {
+          benchOutputEl.textContent = "Benchmark failed: " + err.message;
+          console.error(err);
+        } finally {
+          benchmarkRunning = false;
+          benchRunBtn.disabled = false;
+          applyWorkersBtn.disabled = false;
+        }
+      });
+
+      (async () => {
+        try {
+          await pool.rebuild(1);
+        } catch (err) {
+          statusEl.textContent = "Pool init failed: " + err.message;
+          console.error(err);
+          return;
+        }
+        applyWorkersBtn.disabled = false;
+        benchRunBtn.disabled = false;
+        poolStatusEl.textContent = "Pool ready (1 worker).";
+        statusEl.textContent = "Pool ready. Requesting webcam...";
+        await startWebcam();
+        requestAnimationFrame(tick);
+      })();
+
+      window.addEventListener("beforeunload", () => pool.terminate());
     </script>
   </body>
 </html>

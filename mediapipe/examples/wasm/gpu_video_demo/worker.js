@@ -15,32 +15,28 @@ self.onmessage = async (e) => {
   const msg = e.data;
 
   if (msg.type === "init") {
+    const { canvas, id } = msg;
     try {
-      // Without this, Emscripten's pthread bootstrap (libpthread.js,
-      // allocateUnusedWorker) resolves its own script URL via
-      // self.location.href, which -- because this file was reached via
-      // importScripts() rather than being the Worker's own entry script --
-      // still points at worker.js instead of gpu_video_demo.js. Every new
-      // pthread Worker then reloads worker.js from scratch and waits for a
-      // {type:"init"|"frame"} message that never comes, hanging forever
-      // with no console error. Providing mainScriptUrlOrBlob explicitly
-      // bypasses that broken auto-detection.
+      // mainScriptUrlOrBlob stays explicit even without -pthread: it's a
+      // no-op safety net if pthread bootstrap machinery is ever re-enabled
+      // (see historical note this fixed, commit 7b258581c), and costs
+      // nothing to keep.
       const Module = await GpuVideoDemoModule({
-        canvas: msg.canvas,
+        canvas,
         mainScriptUrlOrBlob: "gpu_video_demo.js",
       });
       demo = new Module.GpuVideoDemo();
       const initResult = demo.initialize();
-      console.log("[worker] initialize() result:", initResult);
-      self.postMessage({ type: "ready" });
+      console.log(`[worker ${id}] initialize() result:`, initResult);
+      self.postMessage({ type: "ready", id });
     } catch (err) {
-      self.postMessage({ type: "error", message: String(err) });
+      self.postMessage({ type: "error", id, message: String(err) });
     }
     return;
   }
 
   if (msg.type === "frame") {
-    const { bitmap, width, height } = msg;
+    const { bitmap, width, height, seq } = msg;
     if (!scratchCanvas || scratchCanvas.width !== width || scratchCanvas.height !== height) {
       scratchCanvas = new OffscreenCanvas(width, height);
       scratchCtx = scratchCanvas.getContext("2d", { willReadFrequently: true });
@@ -56,6 +52,21 @@ self.onmessage = async (e) => {
     // before transferring it back to the main thread -- transferring wasm's
     // own memory would detach it from the module.
     const outBuffer = new Uint8Array(result).buffer;
-    self.postMessage({ type: "result", buffer: outBuffer, width, height }, [outBuffer]);
+    self.postMessage({ type: "result", buffer: outBuffer, width, height, seq }, [outBuffer]);
+    return;
+  }
+
+  if (msg.type === "benchmark") {
+    const { data, width, height, repeat } = msg;
+    // Runs entirely inside this worker, without going back through the
+    // event loop between frames: postMessage-ing `repeat` individual
+    // "frame" messages would let structured-clone/message overhead of a
+    // multi-hundred-KB RGBA buffer dominate the timing this is meant to
+    // measure. The processed result is discarded -- only throughput matters
+    // for a benchmark run.
+    for (let i = 0; i < repeat; i++) {
+      demo.processFrame(data, width, height);
+    }
+    self.postMessage({ type: "benchmark-result", framesProcessed: repeat });
   }
 };

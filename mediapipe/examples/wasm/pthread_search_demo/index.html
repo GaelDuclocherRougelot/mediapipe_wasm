@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Parallel search proof of concept (-pthread, no merge)</title>
+  </head>
+  <body>
+    <p>
+      Searches the same random int array single-threaded (baseline) and
+      multi-threaded (N real std::thread, each scanning its own slice of one
+      shared std::vector; a shared std::atomic&lt;int&gt; records the winner
+      and lets the other workers stop early — no merge phase, contrast with
+      the sort demo).
+    </p>
+    <p>
+      Array size:
+      <input id="size" type="number" value="20000000" style="width: 10em" />
+    </p>
+    <p>
+      Threads:
+      <input id="threads" type="number" value="8" style="width: 4em" />
+      (navigator.hardwareConcurrency = <span id="cores"></span>)
+    </p>
+    <p>
+      Target position (% into the array, -1 = not present):
+      <input id="percent" type="number" value="90" min="-1" max="100" style="width: 4em" />
+    </p>
+    <button id="run" disabled>Loading module...</button>
+    <pre id="output"></pre>
+
+    <script src="pthread_search_demo.js"></script>
+    <script>
+      document.getElementById("cores").textContent = navigator.hardwareConcurrency;
+
+      const runButton = document.getElementById("run");
+      const outputEl = document.getElementById("output");
+      let Module = null;
+
+      PthreadSearchDemoModule().then((m) => {
+        Module = m;
+        runButton.disabled = false;
+        runButton.textContent = "Run benchmark";
+      });
+
+      runButton.addEventListener("click", () => {
+        const size = parseInt(document.getElementById("size").value, 10);
+        const numThreads = parseInt(document.getElementById("threads").value, 10);
+        const percent = parseInt(document.getElementById("percent").value, 10);
+        runButton.disabled = true;
+        runButton.textContent = "Running...";
+        outputEl.textContent = "";
+        // Yield one frame so the button's disabled state paints before the
+        // (synchronous, main-thread) benchmark blocks the page.
+        requestAnimationFrame(() => {
+          const bench = new Module.SearchBenchmark();
+          const result = bench.runBenchmark(size, numThreads, percent);
+          outputEl.textContent = result;
+          runButton.disabled = false;
+          runButton.textContent = "Run benchmark";
+        });
+      });
+    </script>
+  </body>
+</html>
